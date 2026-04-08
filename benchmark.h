@@ -101,6 +101,7 @@ static void* DoOpsCoreLoop(void* param) {
     switch (op) {
       case util::LOOKUP: {
         size_t idx = index->EqualityLookup(lo_key, thread_id);
+        asm volatile("" : : "r"(idx));
         if constexpr (time_each) {
           timing_end();
 
@@ -118,6 +119,7 @@ static void* DoOpsCoreLoop(void* param) {
 
       case util::RANGE_QUERY: {
         uint64_t actual = index->RangeQuery(lo_key, hi_key, thread_id);
+        asm volatile("" : : "r"(actual));
         if constexpr (time_each) {
           timing_end();
 
