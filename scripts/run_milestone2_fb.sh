@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Running Milestone 2 benchmark set (Facebook mixed workloads; includes HybridPGMLippAdv)..."
+echo "Running Milestone 2 benchmark set (Facebook mixed workloads: DynamicPGM, LIPP, HybridPGMLippAdv)..."
 
 BENCHMARK=build/benchmark
 if [[ ! -f "$BENCHMARK" ]]; then
@@ -21,7 +21,7 @@ run_one() {
   "$BENCHMARK" "./data/$DATA" "./data/${DATA}_ops_2M_0.000000rq_0.500000nl_0.100000i_0m_mix" --through --csv --only "$index" -r 3
 }
 
-for INDEX in DynamicPGM LIPP HybridPGMLipp HybridPGMLippAdv; do
+for INDEX in DynamicPGM LIPP HybridPGMLippAdv; do
   run_one "$INDEX"
 done
 

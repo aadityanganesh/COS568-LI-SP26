@@ -5,7 +5,7 @@
 #   sbatch milestone2.slurm
 #
 # This job runs only Facebook mixed workloads for:
-#   DynamicPGM, LIPP, HybridPGMLipp
+#   DynamicPGM, LIPP, HybridPGMLippAdv (see scripts/run_milestone2_fb.sh)
 
 #SBATCH --job-name=milestone2
 #SBATCH --nodes=1
