@@ -1,0 +1,40 @@
+Bloom false-positive rate (fp) sweep — quick lab notebook
+============================================================
+
+What you are changing
+  In competitors/hybrid_pgm_lipp_advanced.h search for:
+    bloom_.init(
+  There are two calls (initial Build and rebuild_bloom_from_lipp). Keep them THE SAME fp for a fair sweep.
+
+Suggested three values (pick order you like)
+  A) fp = 0.02   (looser Bloom → fewer bits / maybe more false positives)
+  B) fp = 0.01   (current default)
+  C) fp = 0.005  (stricter Bloom → more bits / maybe fewer false positives)
+
+No internet needed
+  build_benchmark.sh only runs cmake + make on the node (uses gcc/boost modules). No wget.
+
+One workload to keep it simple (recommended first)
+  Facebook LIPP vs Adv only (fast):
+    rm -f results/*.csv
+    sbatch milestone_lipp_vs_adv.slurm
+  After each fp change: pull/edit/rebuild is automatic if Slurm runs build (see milestone_*_bench_only.slurm).
+
+Results table (fill in after each run)
+------------------------------------------------------------------
+fp      | mix (10% / 90%) | Adv thr mean (cols 6-8) | Adv size GiB (col 5) | LIPP thr mean | notes
+--------|-----------------|-------------------------|----------------------|---------------|------
+0.02    | 10%             |                         |                      |               |
+0.02    | 90%             |                         |                      |               |
+0.01    | 10%             |                         |                      |               |
+0.01    | 90%             |                         |                      |               |
+0.005   | 10%             |                         |                      |               |
+0.005   | 90%             |                         |                      |               |
+
+How to fill "thr mean" from CSV (example)
+  grep '^HybridPGMLippAdv,' results/fb_100M_public_uint64_ops_2M_0.000000rq_0.500000nl_0.100000i_0m_mix_results_table.csv
+  Take ONE block of 3 rows (same fp run). For each row: mean = (col6+col7+col8)/3.
+  Report best variant or mean-of-three-variants — pick one rule and stick to it.
+
+If you see duplicate rows per index
+  rm -f results/*.csv before each run, or use scripts that delete target CSVs first.

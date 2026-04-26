@@ -1,6 +1,6 @@
 #!/bin/bash
 # LIPP vs HybridPGMLippAdv only — one dataset (default: Facebook via run script).
-# Benchmarks only: no download, cmake, generate, or full rebuild here.
+# No download or generate. Builds benchmark on the node (no internet).
 #
 # Override dataset on the compute node:
 #   sbatch --export=DATASET=books_100M_public_uint64 milestone_lipp_vs_adv.slurm
@@ -29,12 +29,16 @@ export PATH="/usr/bin:/bin:/usr/local/bin:${PATH:-}"
 module purge
 module load gcc/11 boost/1.85.0
 
+chmod +x scripts/*.sh 2>/dev/null || true
+
+echo "=== build_benchmark (no network) ==="
+bash ./scripts/build_benchmark.sh
+
 if [[ ! -x build/benchmark ]]; then
-  echo "ERROR: build/benchmark missing. Build on vis: bash scripts/build_benchmark.sh"
+  echo "ERROR: build/benchmark missing after build. On vis run once:"
+  echo "  bash scripts/create_minimal_cmake.sh && rm -rf build && bash scripts/build_benchmark.sh"
   exit 1
 fi
-
-chmod +x scripts/*.sh 2>/dev/null || true
 
 export DATASET="${DATASET:-fb_100M_public_uint64}"
 echo "=== LIPP vs HybridPGMLippAdv | dataset=${DATASET} ==="

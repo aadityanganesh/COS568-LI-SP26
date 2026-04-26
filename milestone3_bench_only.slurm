@@ -1,10 +1,11 @@
 #!/bin/bash
-# Milestone 3 — benchmarks only (no download, cmake, generate, or build).
+# Milestone 3 — benchmarks only (no download, generate, or full pipeline).
+# Builds benchmark on the compute node (cmake+make; no internet).
 #
-# Prereqs on shared filesystem (prepare on adroit-vis or a prior job):
+# Prereqs on shared filesystem:
+#   - Minimal CMakeLists from a prior: bash scripts/create_minimal_cmake.sh (once on vis if needed)
 #   - data/books_100M_public_uint64, fb_..., osmc_...
 #   - data/*_ops_2M_* mix files from scripts/generate_workloads.sh
-#   - build/benchmark from scripts/build_benchmark.sh
 #
 # Usage (from repo root):
 #   sbatch milestone3_bench_only.slurm
@@ -27,13 +28,16 @@ export PATH="/usr/bin:/bin:/usr/local/bin:${PATH:-}"
 module purge
 module load gcc/11 boost/1.85.0
 
+chmod +x scripts/*.sh 2>/dev/null || true
+
+echo "=== build_benchmark (no network) ==="
+bash ./scripts/build_benchmark.sh
+
 if [[ ! -x build/benchmark ]]; then
-  echo "ERROR: build/benchmark missing or not executable. Build on vis first:"
+  echo "ERROR: build/benchmark missing after build. On vis run once:"
   echo "  bash scripts/create_minimal_cmake.sh && rm -rf build && bash scripts/build_benchmark.sh"
   exit 1
 fi
-
-chmod +x scripts/*.sh 2>/dev/null || true
 
 echo "=== run_milestone3_mix (benchmark only) ==="
 bash ./scripts/run_milestone3_mix.sh
