@@ -1,5 +1,6 @@
 #!/bin/bash
 # Milestone 2 — benchmarks only (Facebook: 90% and 10% insert mixes).
+# Indexes: DynamicPGM, LIPP, HybridPGMLipp, HybridPGMLippAdv.
 # No download, cmake, generate, or build.
 #
 # Prereqs on shared filesystem:
