@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include "./lipp/src/core/lipp.h"
 #include "base.h"
 
@@ -39,6 +41,15 @@ public:
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
         lipp_.insert(data.key, data.value);
+    }
+
+    /** In-order walk of every stored key (for maintenance tasks such as Bloom rebuild). */
+    template <class Fn>
+    void for_each_leaf_key(Fn&& fn) const {
+        const KeyType lo = std::numeric_limits<KeyType>::lowest();
+        for (auto it = lipp_.lower_bound(lo); it != lipp_.end(); ++it) {
+            fn(it->comp.data.key);
+        }
     }
 
     bool applicable(bool unique, bool range_query, bool insert, bool multithread, const std::string& ops_filename) {

@@ -15,6 +15,10 @@
  * - configurable flush threshold: params[1] = permille of bulk size (default 500 = 5%)
  * - sorted buffer before LIPP inserts on flush (reduces random insertion order)
  * - Bloom filter on keys (bulk + every insert): definite negatives skip PGM/LIPP
+ * - Periodic Bloom compaction (not every flush): after a flush, every R flushes we rebuild
+ *   the filter from the LIPP key set so m/k match current n (fewer false positives, often
+ *   smaller RAM). R defaults from flush_permille_ (more frequent flushes ⇒ larger R to
+ *   amortize O(n) scans); override with params[2] = R (clamped 2..24).
  */
 template <class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
@@ -25,6 +29,26 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   size_t total_size = 0;
   std::vector<KeyValue<KeyType>> buffer;
   BloomFilterUint64 bloom_;
+  int bloom_rebuild_period_flushes_ = 5;
+  int flushes_since_bloom_rebuild_ = 0;
+
+  int bloom_rebuild_period_from_permille() const {
+    if (params_.size() > 2) {
+      return std::max(2, std::min(24, params_[2]));
+    }
+    const int p = std::max(1, flush_permille_);
+    // Eager flush (small p) ⇒ fewer full LIPP rescans; relaxed flush (large p) ⇒ rebuild a
+    // bit more often so lookup-heavy mixes do not live forever on an oversized filter.
+    const int r = 3 + (2000 / (p + 200));
+    return std::max(2, std::min(12, r));
+  }
+
+  void rebuild_bloom_from_lipp() {
+    const size_t headroom = std::max(size_t{65536}, total_size / 150);
+    bloom_.clear();
+    bloom_.init(total_size + headroom, 0.01);
+    lipp.for_each_leaf_key([this](const KeyType& k) { bloom_.add(static_cast<uint64_t>(k)); });
+  }
 
  public:
   DynamicPGM<KeyType, SearchClass, pgm_error> pgm;
@@ -35,6 +59,8 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     if (params_.size() > 1) {
       flush_permille_ = std::max(1, std::min(5000, params_[1]));
     }
+    bloom_rebuild_period_flushes_ = bloom_rebuild_period_from_permille();
+    flushes_since_bloom_rebuild_ = 0;
   }
 
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
@@ -46,7 +72,9 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     buffer.clear();
     buffer.reserve(reserve_n);
     pgm = decltype(pgm)(params_);
-    const size_t bloom_capacity = total_size + 4000000;
+    bloom_rebuild_period_flushes_ = bloom_rebuild_period_from_permille();
+    flushes_since_bloom_rebuild_ = 0;
+    const size_t bloom_capacity = total_size + std::min(size_t{4000000}, total_size / 8 + size_t{65536});
     bloom_.clear();
     bloom_.init(bloom_capacity, 0.01);
     for (const auto& kv : data) {
@@ -88,6 +116,12 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
       buffer.clear();
       pgm = decltype(pgm)(params_);
       pgm_size = 0;
+
+      ++flushes_since_bloom_rebuild_;
+      if (flushes_since_bloom_rebuild_ >= bloom_rebuild_period_flushes_) {
+        rebuild_bloom_from_lipp();
+        flushes_since_bloom_rebuild_ = 0;
+      }
     }
   }
 
