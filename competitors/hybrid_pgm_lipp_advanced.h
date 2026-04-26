@@ -31,6 +31,8 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   BloomFilterUint64 bloom_;
   int bloom_rebuild_period_flushes_ = 5;
   int flushes_since_bloom_rebuild_ = 0;
+  // Target Bloom false-positive rate (edit here, or use scripts/run_bloom_fp_sweep.sh).
+  static constexpr double k_bloom_fp = 0.01;
 
   int bloom_rebuild_period_from_permille() const {
     if (params_.size() > 2) {
@@ -46,7 +48,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   void rebuild_bloom_from_lipp() {
     const size_t headroom = std::max(size_t{65536}, total_size / 150);
     bloom_.clear();
-    bloom_.init(total_size + headroom, 0.01);
+    bloom_.init(total_size + headroom, k_bloom_fp);
     lipp.for_each_leaf_key([this](const KeyType& k) { bloom_.add(static_cast<uint64_t>(k)); });
   }
 
@@ -76,7 +78,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     flushes_since_bloom_rebuild_ = 0;
     const size_t bloom_capacity = total_size + std::min(size_t{4000000}, total_size / 8 + size_t{65536});
     bloom_.clear();
-    bloom_.init(bloom_capacity, 0.01);
+    bloom_.init(bloom_capacity, k_bloom_fp);
     for (const auto& kv : data) {
       bloom_.add(static_cast<uint64_t>(kv.key));
     }
