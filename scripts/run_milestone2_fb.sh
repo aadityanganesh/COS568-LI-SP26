@@ -12,6 +12,11 @@ fi
 DATA=fb_100M_public_uint64
 mkdir -p ./results
 
+echo "Removing old Milestone 2 FB mix CSVs (benchmark appends; avoid stacked runs)..."
+for MIX in 0.900000i_0m_mix 0.100000i_0m_mix; do
+  rm -f "./results/${DATA}_ops_2M_0.000000rq_0.500000nl_${MIX}_results_table.csv"
+done
+
 run_one() {
   local index="$1"
   echo "Index: $index | workload: 0.9 insert mixed"

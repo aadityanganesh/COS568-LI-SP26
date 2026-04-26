@@ -23,6 +23,11 @@ fi
 mkdir -p ./results
 
 MIXES=(0.900000i_0m_mix 0.100000i_0m_mix)
+echo "Removing old LIPP-vs-Adv result CSVs for this dataset (benchmark appends; avoid stacked runs)..."
+for MIX in "${MIXES[@]}"; do
+  rm -f "./results/${DATASET}_ops_2M_0.000000rq_0.500000nl_${MIX}_results_table.csv"
+done
+
 INDEXES=(LIPP HybridPGMLippAdv)
 
 for MIX in "${MIXES[@]}"; do
