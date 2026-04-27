@@ -2,6 +2,7 @@
 #define TLI_HYBRID_PGM_LIPP_ADVANCED_H
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 #include "../util.h"
@@ -11,14 +12,31 @@
 #include "lipp.h"
 
 /**
- * Milestone 3 hybrid: PGM + LIPP with
- * - configurable flush threshold: params[1] = permille of bulk size (default 500 = 5%)
- * - sorted buffer before LIPP inserts on flush (reduces random insertion order)
- * - Bloom filter on keys (bulk + every insert): definite negatives skip PGM/LIPP
- * - Periodic Bloom compaction (not every flush): after a flush, every R flushes we rebuild
- *   the filter from the LIPP key set so m/k match current n (fewer false positives, often
- *   smaller RAM). R defaults from flush_permille_ (more frequent flushes ⇒ larger R to
- *   amortize O(n) scans); override with params[2] = R (clamped 2..24).
+ * Milestone 3 hybrid: DynamicPGM (delta) + LIPP (cold), with three lookup-path
+ * optimizations stacked on top of the milestone-2 sorted-flush baseline.
+ *
+ *  1. Delta-only Bloom filter.
+ *     The Bloom now tracks ONLY keys present in the current DPGM buffer, not
+ *     the 100M bulk-loaded LIPP set. A "no" answer therefore means "definitely
+ *     not in the delta", letting the lookup skip the DPGM probe entirely and
+ *     go straight to LIPP. With the old global Bloom, the answer was almost
+ *     always "maybe" once 100M keys had been added, so the Bloom probe cost
+ *     was paid on every lookup without saving any work.
+ *
+ *  2. Constant-time [min_delta, max_delta] range gate.
+ *     Updated on each Insert and reset on flush. A lookup_key outside the gate
+ *     cannot be in the delta, so it skips both the Bloom and the DPGM probe.
+ *     This is two compares and runs ahead of the Bloom in the hot path.
+ *
+ *  3. No periodic O(n) Bloom rebuild from LIPP.
+ *     Because the Bloom now resets at every flush along with the buffer and
+ *     the DPGM, there is no need for the previous `for_each_leaf_key` walk.
+ *     Flush cost goes back to "sort + drain"; the rest is O(bloom bytes).
+ *
+ * Tunables (ABI unchanged):
+ *   params[1]  Flush threshold in permille of total_size (default 500 = 5%).
+ *   params[2]  Retained for backward CLI compat. Previously the Bloom rebuild
+ *              cadence; now ignored (the Bloom resets naturally on flush).
  */
 template <class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
@@ -28,28 +46,31 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   size_t pgm_size = 0;
   size_t total_size = 0;
   std::vector<KeyValue<KeyType>> buffer;
+
   BloomFilterUint64 bloom_;
-  int bloom_rebuild_period_flushes_ = 5;
-  int flushes_since_bloom_rebuild_ = 0;
-  // Target Bloom false-positive rate (edit here, or use scripts/run_bloom_fp_sweep.sh).
+
+  KeyType min_delta_ = std::numeric_limits<KeyType>::max();
+  KeyType max_delta_ = std::numeric_limits<KeyType>::lowest();
+
+  // Target Bloom false-positive rate. Patched in-place by
+  // scripts/run_bloom_fp_sweep.sh; do not rename without updating that script.
   static constexpr double k_bloom_fp = 0.01;
 
-  int bloom_rebuild_period_from_permille() const {
-    if (params_.size() > 2) {
-      return std::max(2, std::min(24, params_[2]));
-    }
-    const int p = std::max(1, flush_permille_);
-    // Eager flush (small p) ⇒ fewer full LIPP rescans; relaxed flush (large p) ⇒ rebuild a
-    // bit more often so lookup-heavy mixes do not live forever on an oversized filter.
-    const int r = 3 + (2000 / (p + 200));
-    return std::max(2, std::min(12, r));
+  size_t expected_delta_capacity() const {
+    const size_t n = std::max<size_t>(total_size, 1);
+    const size_t cap =
+        (static_cast<size_t>(std::max(1, flush_permille_)) * n) / 10000;
+    return std::max<size_t>(cap, size_t{1024});
   }
 
-  void rebuild_bloom_from_lipp() {
-    const size_t headroom = std::max(size_t{65536}, total_size / 150);
+  void reset_delta_state() {
+    buffer.clear();
+    pgm = decltype(pgm)(params_);
+    pgm_size = 0;
     bloom_.clear();
-    bloom_.init(total_size + headroom, k_bloom_fp);
-    lipp.for_each_leaf_key([this](const KeyType& k) { bloom_.add(static_cast<uint64_t>(k)); });
+    bloom_.init(expected_delta_capacity() + 64, k_bloom_fp);
+    min_delta_ = std::numeric_limits<KeyType>::max();
+    max_delta_ = std::numeric_limits<KeyType>::lowest();
   }
 
  public:
@@ -61,39 +82,33 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     if (params_.size() > 1) {
       flush_permille_ = std::max(1, std::min(5000, params_[1]));
     }
-    bloom_rebuild_period_flushes_ = bloom_rebuild_period_from_permille();
-    flushes_since_bloom_rebuild_ = 0;
   }
 
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
     total_size = data.size();
-    const size_t reserve_n =
-        static_cast<size_t>((static_cast<double>(flush_permille_) / 10000.0) *
-                            static_cast<double>(total_size)) +
-        8;
     buffer.clear();
-    buffer.reserve(reserve_n);
+    buffer.reserve(expected_delta_capacity() + 8);
     pgm = decltype(pgm)(params_);
-    bloom_rebuild_period_flushes_ = bloom_rebuild_period_from_permille();
-    flushes_since_bloom_rebuild_ = 0;
-    const size_t bloom_capacity = total_size + std::min(size_t{4000000}, total_size / 8 + size_t{65536});
+    pgm_size = 0;
     bloom_.clear();
-    bloom_.init(bloom_capacity, k_bloom_fp);
-    for (const auto& kv : data) {
-      bloom_.add(static_cast<uint64_t>(kv.key));
-    }
+    bloom_.init(expected_delta_capacity() + 64, k_bloom_fp);
+    min_delta_ = std::numeric_limits<KeyType>::max();
+    max_delta_ = std::numeric_limits<KeyType>::lowest();
     return lipp.Build(data, num_threads);
   }
 
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
-    if (!bloom_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
-      return static_cast<size_t>(util::NOT_FOUND);
+    // Hot path: range gate first, then delta-only Bloom, then DPGM. Anything
+    // that fails a gate goes straight to LIPP.
+    if (pgm_size > 0 &&
+        lookup_key >= min_delta_ && lookup_key <= max_delta_ &&
+        bloom_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+      const size_t value = pgm.EqualityLookup(lookup_key, thread_id);
+      if (value != util::OVERFLOW) {
+        return value;
+      }
     }
-    size_t value = pgm.EqualityLookup(lookup_key, thread_id);
-    if (value == util::OVERFLOW) {
-      value = lipp.EqualityLookup(lookup_key, thread_id);
-    }
-    return value;
+    return lipp.EqualityLookup(lookup_key, thread_id);
   }
 
   uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key,
@@ -104,26 +119,24 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
     pgm.Insert(data, thread_id);
     bloom_.add(static_cast<uint64_t>(data.key));
+    if (data.key < min_delta_) min_delta_ = data.key;
+    if (data.key > max_delta_) max_delta_ = data.key;
     buffer.push_back(data);
     pgm_size++;
     total_size++;
 
-    const size_t threshold = std::max(size_t{1}, (static_cast<size_t>(flush_permille_) * total_size) / 10000);
+    const size_t threshold = std::max(
+        size_t{1},
+        (static_cast<size_t>(flush_permille_) * total_size) / 10000);
     if (pgm_size >= threshold) {
       std::sort(buffer.begin(), buffer.end(),
-                [](const KeyValue<KeyType>& a, const KeyValue<KeyType>& b) { return a.key < b.key; });
+                [](const KeyValue<KeyType>& a, const KeyValue<KeyType>& b) {
+                  return a.key < b.key;
+                });
       for (const auto& it : buffer) {
         lipp.Insert(it, thread_id);
       }
-      buffer.clear();
-      pgm = decltype(pgm)(params_);
-      pgm_size = 0;
-
-      ++flushes_since_bloom_rebuild_;
-      if (flushes_since_bloom_rebuild_ >= bloom_rebuild_period_flushes_) {
-        rebuild_bloom_from_lipp();
-        flushes_since_bloom_rebuild_ = 0;
-      }
+      reset_delta_state();
     }
   }
 
