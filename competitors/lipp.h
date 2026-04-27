@@ -43,6 +43,14 @@ public:
         lipp_.insert(data.key, data.value);
     }
 
+    /** Rebuild this LIPP in place from a sorted vector of (key, value) pairs.
+     *  Avoids needing a move-assignment on this wrapper, which is unavailable
+     *  because the underlying LIPP type is not move-assignable. The input
+     *  must be sorted ascending by key (matching bulk_load expectations). */
+    void rebuild_from_sorted_kvs(const std::vector<std::pair<KeyType, uint64_t>>& sorted_kvs) {
+        lipp_.bulk_load(sorted_kvs.data(), static_cast<int>(sorted_kvs.size()));
+    }
+
     /** In-order walk of every stored key (for maintenance tasks such as Bloom rebuild). */
     template <class Fn>
     void for_each_leaf_key(Fn&& fn) const {

@@ -125,20 +125,17 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     frozen_drain_cursor_ = 0;
   }
 
-  // (B) Bulk-rebuild LIPP from its own current keys. Transient sorted vector
-  // that exists only inside this call; afterwards keys live only in LIPP.
+  // (B) Bulk-rebuild LIPP in place from its own current keys. The transient
+  // sorted vector lives only inside this call; afterwards the keys live only
+  // in LIPP. We rebuild in place because Lipp<KeyType> is not move-assignable
+  // (the underlying LIPP class is not designed to be reassigned wholesale).
   void rebuild_lipp_from_lipp() {
-    std::vector<KeyValue<KeyType>> all;
-    all.reserve(total_size_);
-    lipp.for_each_leaf_kv([&all](const KeyType& k, uint64_t v) {
-      KeyValue<KeyType> kv;
-      kv.key = k;
-      kv.value = v;
-      all.push_back(kv);
+    std::vector<std::pair<KeyType, uint64_t>> sorted_kvs;
+    sorted_kvs.reserve(total_size_);
+    lipp.for_each_leaf_kv([&sorted_kvs](const KeyType& k, uint64_t v) {
+      sorted_kvs.emplace_back(k, v);
     });
-    Lipp<KeyType> fresh(params_);
-    (void)fresh.Build(all, 1);
-    lipp = std::move(fresh);
+    lipp.rebuild_from_sorted_kvs(sorted_kvs);
   }
 
   void drain_some(size_t budget, uint32_t thread_id) {
