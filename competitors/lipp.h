@@ -52,6 +52,16 @@ public:
         }
     }
 
+    /** In-order walk of every (key, value) pair (used for periodic LIPP
+     *  bulk-rebuild from current contents). */
+    template <class Fn>
+    void for_each_leaf_kv(Fn&& fn) const {
+        const KeyType lo = std::numeric_limits<KeyType>::lowest();
+        for (auto it = lipp_.lower_bound(lo); it != lipp_.end(); ++it) {
+            fn(it->comp.data.key, it->comp.data.value);
+        }
+    }
+
     bool applicable(bool unique, bool range_query, bool insert, bool multithread, const std::string& ops_filename) {
         // LIPP only supports unique keys.
         return unique && !multithread;

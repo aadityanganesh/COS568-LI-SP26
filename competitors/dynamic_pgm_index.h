@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 #include "../util.h"
@@ -52,6 +53,16 @@ class DynamicPGM : public Competitor<KeyType, SearchClass> {
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
     pgm_.insert(data.key, data.value);
+  }
+
+  // In-order walk of every (key, value) pair, used by HybridPGMLippAdv to
+  // build a transient sorted ferry vector from the frozen DPGM at swap time.
+  template <class Fn>
+  void for_each_kv(Fn&& fn) const {
+    auto it = pgm_.lower_bound(std::numeric_limits<KeyType>::lowest());
+    for (; it != pgm_.end(); ++it) {
+      fn(it->key(), it->value());
+    }
   }
 
   std::string name() const { return "DynamicPGM"; }

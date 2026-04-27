@@ -2,7 +2,10 @@
 #define TLI_HYBRID_PGM_LIPP_ADVANCED_H
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "../util.h"
@@ -12,131 +15,224 @@
 #include "lipp.h"
 
 /**
- * Milestone 3 hybrid: DynamicPGM (delta) + LIPP (cold), with three lookup-path
- * optimizations stacked on top of the milestone-2 sorted-flush baseline.
+ * Milestone 3 hybrid (Stage 2). Pure DPGM + LIPP design with a Bloom side
+ * filter and trivial scalar metadata; no other key-storing structures.
  *
- *  1. Delta-only Bloom filter.
- *     The Bloom now tracks ONLY keys present in the current DPGM buffer, not
- *     the 100M bulk-loaded LIPP set. A "no" answer therefore means "definitely
- *     not in the delta", letting the lookup skip the DPGM probe entirely and
- *     go straight to LIPP. With the old global Bloom, the answer was almost
- *     always "maybe" once 100M keys had been added, so the Bloom probe cost
- *     was paid on every lookup without saving any work.
+ *  (A) Two DPGM buffers, "active" + "frozen".
+ *      Inserts always go to pgm_active_. When pgm_active_ reaches its
+ *      capacity, its keys move into pgm_frozen_ (which is empty by that
+ *      point) and pgm_active_ is reset for fresh inserts. Lookups probe
+ *      active first, then frozen, then LIPP.
  *
- *  2. Constant-time [min_delta, max_delta] range gate.
- *     Updated on each Insert and reset on flush. A lookup_key outside the gate
- *     cannot be in the delta, so it skips both the Bloom and the DPGM probe.
- *     This is two compares and runs ahead of the Bloom in the hot path.
+ *  (B) Cooperative drain, with optional periodic LIPP bulk-rebuild.
+ *      Every Insert pops up to `kDrainBudgetPerInsert` keys out of the
+ *      frozen DPGM and pushes them into LIPP. This amortizes flush work
+ *      across many Inserts instead of taking one stop-the-world hit at
+ *      threshold. After every `kRebuildEveryDrains` completed drains we
+ *      also rebuild LIPP via bulk_load. The default constant is huge so
+ *      the rebuild is OFF; lower it to enable.
  *
- *  3. No periodic O(n) Bloom rebuild from LIPP.
- *     Because the Bloom now resets at every flush along with the buffer and
- *     the DPGM, there is no need for the previous `for_each_leaf_key` walk.
- *     Flush cost goes back to "sort + drain"; the rest is O(bloom bytes).
+ *  (C) No persistent side vector for active.
+ *      The active path stores keys only in pgm_active_ plus its Bloom and
+ *      min/max gate. At swap time we materialize a transient sorted
+ *      "drain" vector by walking the frozen DPGM in key order; that
+ *      vector lives only until the drain finishes, then is cleared.
  *
- * Tunables (ABI unchanged):
- *   params[1]  Flush threshold in permille of total_size (default 500 = 5%).
- *   params[2]  Retained for backward CLI compat. Previously the Bloom rebuild
- *              cadence; now ignored (the Bloom resets naturally on flush).
+ *  (D) Per-buffer min/max gate + delta-only Bloom.
+ *      Each DPGM has its own gate and its own Bloom, sized for that
+ *      buffer's capacity. A lookup goes (active gate+bloom -> active DPGM),
+ *      (frozen gate+bloom -> frozen DPGM), (LIPP).
+ *
+ * ABI compatibility:
+ *   params[1]  flush_permille used to size the active cap (default 500).
+ *   params[2]  accepted but ignored (legacy bloom-rebuild knob).
+ *   The constant `k_bloom_fp` is patched in-place by
+ *   scripts/run_bloom_fp_sweep.sh; keep its name and shape.
  */
 template <class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
  private:
+  using PGM = DynamicPGM<KeyType, SearchClass, pgm_error>;
+
   std::vector<int> params_;
   int flush_permille_ = 500;
-  size_t pgm_size = 0;
-  size_t total_size = 0;
-  std::vector<KeyValue<KeyType>> buffer;
+  size_t total_size_ = 0;
+  size_t active_cap_ = 1024;
 
-  BloomFilterUint64 bloom_;
-
-  KeyType min_delta_ = std::numeric_limits<KeyType>::max();
-  KeyType max_delta_ = std::numeric_limits<KeyType>::lowest();
-
-  // Target Bloom false-positive rate. Patched in-place by
-  // scripts/run_bloom_fp_sweep.sh; do not rename without updating that script.
   static constexpr double k_bloom_fp = 0.01;
+  static constexpr size_t kDrainBudgetPerInsert = 4;
+  // Periodic LIPP bulk-rebuild cadence. Default is effectively off because at
+  // 100M / 2M-op benchmarks an O(n) rebuild dominates the run; lower this to
+  // experiment with rebuild-driven LIPP compaction.
+  static constexpr size_t kRebuildEveryDrains = (size_t{1} << 30);
 
-  size_t expected_delta_capacity() const {
-    const size_t n = std::max<size_t>(total_size, 1);
+  PGM pgm_active_;
+  BloomFilterUint64 bloom_active_;
+  KeyType min_active_ = std::numeric_limits<KeyType>::max();
+  KeyType max_active_ = std::numeric_limits<KeyType>::lowest();
+  size_t active_size_ = 0;
+
+  PGM pgm_frozen_;
+  BloomFilterUint64 bloom_frozen_;
+  KeyType min_frozen_ = std::numeric_limits<KeyType>::max();
+  KeyType max_frozen_ = std::numeric_limits<KeyType>::lowest();
+  size_t frozen_size_ = 0;
+  std::vector<KeyValue<KeyType>> frozen_drain_;
+  size_t frozen_drain_cursor_ = 0;
+
+  size_t drains_since_rebuild_ = 0;
+
+  size_t compute_active_cap(size_t total) const {
+    const size_t denom = 10000;
     const size_t cap =
-        (static_cast<size_t>(std::max(1, flush_permille_)) * n) / 10000;
+        (static_cast<size_t>(std::max(1, flush_permille_)) *
+         std::max<size_t>(total, 1)) /
+        denom;
     return std::max<size_t>(cap, size_t{1024});
   }
 
-  void reset_delta_state() {
-    buffer.clear();
-    pgm = decltype(pgm)(params_);
-    pgm_size = 0;
-    bloom_.clear();
-    bloom_.init(expected_delta_capacity() + 64, k_bloom_fp);
-    min_delta_ = std::numeric_limits<KeyType>::max();
-    max_delta_ = std::numeric_limits<KeyType>::lowest();
+  void reset_active() {
+    pgm_active_ = PGM(params_);
+    bloom_active_.clear();
+    bloom_active_.init(active_cap_ + 64, k_bloom_fp);
+    min_active_ = std::numeric_limits<KeyType>::max();
+    max_active_ = std::numeric_limits<KeyType>::lowest();
+    active_size_ = 0;
+  }
+
+  void reset_frozen_empty() {
+    pgm_frozen_ = PGM(params_);
+    bloom_frozen_.clear();
+    min_frozen_ = std::numeric_limits<KeyType>::max();
+    max_frozen_ = std::numeric_limits<KeyType>::lowest();
+    frozen_size_ = 0;
+    frozen_drain_.clear();
+    frozen_drain_cursor_ = 0;
+  }
+
+  // Iterate the (already-moved-in) frozen DPGM in key order and copy each
+  // (key, value) pair into the transient drain vector. Lives only until the
+  // drain finishes, at which point reset_frozen_empty() shrinks it.
+  void build_frozen_drain_from_pgm() {
+    frozen_drain_.clear();
+    frozen_drain_.reserve(frozen_size_);
+    pgm_frozen_.for_each_kv([this](const KeyType& k, uint64_t v) {
+      KeyValue<KeyType> kv;
+      kv.key = k;
+      kv.value = v;
+      frozen_drain_.push_back(kv);
+    });
+    frozen_drain_cursor_ = 0;
+  }
+
+  // (B) Bulk-rebuild LIPP from its own current keys. Transient sorted vector
+  // that exists only inside this call; afterwards keys live only in LIPP.
+  void rebuild_lipp_from_lipp() {
+    std::vector<KeyValue<KeyType>> all;
+    all.reserve(total_size_);
+    lipp.for_each_leaf_kv([&all](const KeyType& k, uint64_t v) {
+      KeyValue<KeyType> kv;
+      kv.key = k;
+      kv.value = v;
+      all.push_back(kv);
+    });
+    Lipp<KeyType> fresh(params_);
+    (void)fresh.Build(all, 1);
+    lipp = std::move(fresh);
+  }
+
+  void drain_some(size_t budget, uint32_t thread_id) {
+    if (frozen_size_ == 0) return;
+    while (budget > 0 && frozen_drain_cursor_ < frozen_drain_.size()) {
+      lipp.Insert(frozen_drain_[frozen_drain_cursor_], thread_id);
+      ++frozen_drain_cursor_;
+      --budget;
+    }
+    if (frozen_drain_cursor_ >= frozen_drain_.size()) {
+      reset_frozen_empty();
+      ++drains_since_rebuild_;
+      if (drains_since_rebuild_ >= kRebuildEveryDrains) {
+        rebuild_lipp_from_lipp();
+        drains_since_rebuild_ = 0;
+      }
+    }
+  }
+
+  void try_swap_active_to_frozen() {
+    if (frozen_size_ != 0) return;
+    pgm_frozen_ = std::move(pgm_active_);
+    bloom_frozen_ = std::move(bloom_active_);
+    min_frozen_ = min_active_;
+    max_frozen_ = max_active_;
+    frozen_size_ = active_size_;
+    build_frozen_drain_from_pgm();
+    reset_active();
   }
 
  public:
-  DynamicPGM<KeyType, SearchClass, pgm_error> pgm;
   Lipp<KeyType> lipp;
 
   explicit HybridPGMLippAdv(const std::vector<int>& params)
-      : params_(params), pgm(params), lipp(params) {
+      : params_(params),
+        pgm_active_(params),
+        pgm_frozen_(params),
+        lipp(params) {
     if (params_.size() > 1) {
       flush_permille_ = std::max(1, std::min(5000, params_[1]));
     }
   }
 
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
-    total_size = data.size();
-    buffer.clear();
-    buffer.reserve(expected_delta_capacity() + 8);
-    pgm = decltype(pgm)(params_);
-    pgm_size = 0;
-    bloom_.clear();
-    bloom_.init(expected_delta_capacity() + 64, k_bloom_fp);
-    min_delta_ = std::numeric_limits<KeyType>::max();
-    max_delta_ = std::numeric_limits<KeyType>::lowest();
+    total_size_ = data.size();
+    active_cap_ = compute_active_cap(total_size_);
+    reset_active();
+    reset_frozen_empty();
+    drains_since_rebuild_ = 0;
     return lipp.Build(data, num_threads);
   }
 
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
-    // Hot path: range gate first, then delta-only Bloom, then DPGM. Anything
-    // that fails a gate goes straight to LIPP.
-    if (pgm_size > 0 &&
-        lookup_key >= min_delta_ && lookup_key <= max_delta_ &&
-        bloom_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
-      const size_t value = pgm.EqualityLookup(lookup_key, thread_id);
-      if (value != util::OVERFLOW) {
-        return value;
-      }
+    if (active_size_ > 0 &&
+        lookup_key >= min_active_ && lookup_key <= max_active_ &&
+        bloom_active_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+      const size_t v = pgm_active_.EqualityLookup(lookup_key, thread_id);
+      if (v != util::OVERFLOW) return v;
+    }
+    if (frozen_size_ > 0 &&
+        lookup_key >= min_frozen_ && lookup_key <= max_frozen_ &&
+        bloom_frozen_.maybe_contains(static_cast<uint64_t>(lookup_key))) {
+      const size_t v = pgm_frozen_.EqualityLookup(lookup_key, thread_id);
+      if (v != util::OVERFLOW) return v;
     }
     return lipp.EqualityLookup(lookup_key, thread_id);
   }
 
   uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key,
                       uint32_t thread_id) const {
-    return pgm.RangeQuery(lower_key, upper_key, thread_id);
+    return pgm_active_.RangeQuery(lower_key, upper_key, thread_id);
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-    pgm.Insert(data, thread_id);
-    bloom_.add(static_cast<uint64_t>(data.key));
-    if (data.key < min_delta_) min_delta_ = data.key;
-    if (data.key > max_delta_) max_delta_ = data.key;
-    buffer.push_back(data);
-    pgm_size++;
-    total_size++;
+    drain_some(kDrainBudgetPerInsert, thread_id);
 
-    const size_t threshold = std::max(
-        size_t{1},
-        (static_cast<size_t>(flush_permille_) * total_size) / 10000);
-    if (pgm_size >= threshold) {
-      std::sort(buffer.begin(), buffer.end(),
-                [](const KeyValue<KeyType>& a, const KeyValue<KeyType>& b) {
-                  return a.key < b.key;
-                });
-      for (const auto& it : buffer) {
-        lipp.Insert(it, thread_id);
+    pgm_active_.Insert(data, thread_id);
+    bloom_active_.add(static_cast<uint64_t>(data.key));
+    if (data.key < min_active_) min_active_ = data.key;
+    if (data.key > max_active_) max_active_ = data.key;
+    ++active_size_;
+    ++total_size_;
+
+    if (active_size_ >= active_cap_) {
+      if (frozen_size_ == 0) {
+        try_swap_active_to_frozen();
+      } else {
+        // Frozen still has keys: pay extra drain this op so the next
+        // try_swap can succeed without unbounded active growth.
+        drain_some(active_cap_, thread_id);
+        if (frozen_size_ == 0) {
+          try_swap_active_to_frozen();
+        }
       }
-      reset_delta_state();
     }
   }
 
@@ -151,13 +247,15 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   std::vector<std::string> variants() const {
-    // Keep two variant fields so CSV shape matches other indexes / existing header scripts.
     return {SearchClass::name(), std::to_string(pgm_error)};
   }
 
   std::string name() const { return "HybridPGMLippAdv"; }
 
-  std::size_t size() const { return pgm.size() + lipp.size() + bloom_.size_in_bytes(); }
+  std::size_t size() const {
+    return pgm_active_.size() + pgm_frozen_.size() + lipp.size() +
+           bloom_active_.size_in_bytes() + bloom_frozen_.size_in_bytes();
+  }
 };
 
 #endif  // TLI_HYBRID_PGM_LIPP_ADVANCED_H
