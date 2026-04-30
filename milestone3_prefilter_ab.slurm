@@ -16,7 +16,7 @@
 #SBATCH --job-name=m3-prefilter-ab
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=32G
 #SBATCH --time=16:00:00
 #SBATCH --output=slurm-%j.out

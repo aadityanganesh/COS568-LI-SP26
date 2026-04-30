@@ -2,9 +2,14 @@
 #define TLI_HYBRID_PGM_LIPP_ADVANCED_H
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -16,52 +21,55 @@
 #include "lipp.h"
 
 /**
- * Milestone 3 hybrid (Stage 4). Pure DPGM + LIPP design with three Bloom-style
- * side filters (bits only — no key/value storage outside DPGM and LIPP):
+ * Milestone 3 hybrid (Stage 5). Pure DPGM + LIPP design with Bloom-style side
+ * filters (bits only) and an asynchronous background drain into LIPP.
  *
- *  (A) Two DPGM buffers, "active" + "frozen", with cooperative drain into LIPP.
- *      Inserts always go to pgm_active_. When pgm_active_ reaches active_cap_,
- *      it is moved into pgm_frozen_ and pgm_active_ is reset. Each Insert pops
- *      a few keys out of pgm_frozen_ into LIPP, smoothing what would otherwise
- *      be a single stop-the-world flush. With the default cap (kActiveCapDefault)
- *      sized larger than each benchmark workload, swap+drain stay dormant on
- *      the standard 2M-op runs and inserts only pay DPGM cost; pass a smaller
- *      cap via params[1] to actually exercise drain.
+ * Layered features (all earlier stages preserved):
  *
+ *  (A) Two DPGM buffers, "active" + "frozen". Inserts always go to pgm_active_.
  *  (B) Per-buffer min/max gate + classical Bloom on each DPGM buffer.
- *      Each DPGM has its own min/max range gate and its own small Bloom
- *      (sized for active_cap_ keys, fits in L1/L2). Used on lookups that the
- *      global prefilter could not rule out, to skip the DPGM probe on most
- *      negatives.
- *
- *  (C) Global LIPP-membership prefilter (blocked Bloom).
- *      Seeded from the bulk-loaded keys in Build(), then updated whenever a
- *      key actually transitions into LIPP via drain. Probed first in
- *      EqualityLookup: if the prefilter says "definitely not in LIPP", we
- *      skip the LIPP traversal entirely (the dominant cost on negative
- *      lookups, ~50% of mixed workloads). The blocked layout keeps each
- *      probe to a single 64-byte cache line.
- *
+ *  (C) Global LIPP-membership prefilter (blocked Bloom). Toggled via
+ *      kEnablePrefilter (sed-patched by scripts/run_prefilter_ab.sh).
  *  (D) LIPP-first lookup ordering when the prefilter says "maybe in LIPP".
- *      Uniqueness invariant (keys live in exactly one of {active, frozen,
- *      LIPP}) means the dominant positive case (key in LIPP) skips the gate
- *      / per-buffer Bloom / DPGM probe.
  *
- * Lookup decision tree:
+ * Stage 5 — async drain:
  *
- *     prefilter.maybe(k)?
- *       no  -> (key not in LIPP)         -> probe active+frozen DPGMs only
- *       yes -> probe LIPP
- *               hit  -> return
- *               miss -> probe active+frozen DPGMs
+ *  (E) Background worker thread drains pgm_frozen_ into LIPP in parallel with
+ *      foreground inserts/lookups. The worker is spawned in the constructor
+ *      and stopped in the destructor. It sleeps on a condition variable when
+ *      drain_done_ == true. When the foreground swaps active into frozen, it
+ *      stores drain_done_ = false, builds the sorted drain ferry vector, and
+ *      notifies the worker. The worker pops kWorkerBatchSize keys at a time,
+ *      takes std::unique_lock<std::shared_mutex>(lipp_mtx_) once per batch,
+ *      inserts them, releases the lock. Foreground lookups take a
+ *      std::shared_lock<std::shared_mutex>(lipp_mtx_) only when the worker
+ *      may actually be writing (drain_done_ == false), so the dominant
+ *      "no drain in flight" case pays no lock at all.
  *
- * ABI:
+ *      Correctness invariants:
+ *        - pgm_active_ and pgm_frozen_ are only mutated by the foreground
+ *          (Insert and try_swap_active_to_frozen). The worker reads only
+ *          frozen_drain_ (a sorted snapshot built at swap time) and the
+ *          shared LIPP. So the foreground lookup probes against pgm_active_
+ *          and pgm_frozen_ are race-free without any lock.
+ *        - LIPP is the only structure both threads touch as a writer/reader
+ *          pair. lipp_mtx_ enforces single-writer / multi-reader on it.
+ *        - drain_done_ uses release/acquire ordering so the foreground's
+ *          frozen_drain_ writes happen-before the worker's reads, and the
+ *          worker's LIPP writes happen-before the next foreground swap.
+ *        - Foreground only swaps when drain_done_ == true; if active fills
+ *          while a drain is in flight, the foreground busy-waits (briefly)
+ *          on drain_done_ before swapping. This avoids unbounded active
+ *          growth without paying a lookup-side stall.
+ *
+ *  ABI:
  *   params[1]: active-buffer cap. > 1000 ⇒ absolute keys (e.g. 131072).
  *              ≤ 1000 ⇒ legacy permille of total_size (e.g. 13 ⇒ ~1.3%).
  *              Unset ⇒ kActiveCapDefault.
  *   params[2]: accepted but ignored (legacy bloom-rebuild knob).
- *   k_bloom_fp / k_prefilter_fp constants are patched in-place by the
- *   bloom-fp sweep script; preserve their names and value shapes.
+ *   k_bloom_fp / k_prefilter_fp / kEnablePrefilter constants are patched in
+ *   place by the bloom-fp sweep and prefilter A/B scripts; preserve their
+ *   names and value shapes.
  */
 template <class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
@@ -78,14 +86,14 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   static constexpr size_t kActiveCapDefault = size_t{4} * 1024 * 1024;
   static constexpr size_t kAbsoluteCapMin = 1024;
   static constexpr size_t kAbsoluteCapMax = size_t{8} * 1024 * 1024;
-  // Periodic LIPP bulk-rebuild cadence. Default is effectively off because at
-  // 100M / 2M-op benchmarks an O(n) rebuild dominates the run; lower this to
-  // experiment with rebuild-driven LIPP compaction.
   static constexpr size_t kRebuildEveryDrains = (size_t{1} << 30);
   // (C) Global LIPP-membership prefilter on/off. Patched by
   // scripts/run_prefilter_ab.sh; preserve name and the literal "true"/"false"
   // value so the sed-flip script can find it.
   static constexpr bool kEnablePrefilter = true;
+  // (E) Worker batches LIPP inserts under lipp_mtx_ to amortize lock cost
+  // and minimize lookup-side contention.
+  static constexpr size_t kWorkerBatchSize = 256;
 
   // Cap configuration parsed from params[1]; see compute_active_cap().
   size_t absolute_cap_override_ = 0;
@@ -105,12 +113,17 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   std::vector<KeyValue<KeyType>> frozen_drain_;
   size_t frozen_drain_cursor_ = 0;
 
-  // (C) Global blocked Bloom over keys currently in LIPP. Seeded by Build()
-  // from the bulk-loaded population; updated whenever a key migrates from
-  // pgm_frozen_ into LIPP via drain_some().
   BlockedBloomFilterUint64 prefilter_;
 
   size_t drains_since_rebuild_ = 0;
+
+  // (E) Worker / async-drain state.
+  mutable std::shared_mutex lipp_mtx_;
+  std::mutex worker_mtx_;
+  std::condition_variable worker_cv_;
+  std::atomic<bool> drain_done_{true};
+  std::atomic<bool> stop_{false};
+  std::thread worker_;
 
   size_t compute_active_cap(size_t total) const {
     if (absolute_cap_override_ > 0) {
@@ -132,16 +145,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     return bulk_size + headroom;
   }
 
-  // (A) Drain budget: cheap default of 4 per insert; accelerates only when
-  // frozen has not emptied by the time active is approaching full.
-  size_t drain_budget() const {
-    if (frozen_size_ == 0) return 0;
-    const size_t headroom =
-        (active_size_ < active_cap_) ? (active_cap_ - active_size_) : 1;
-    const size_t needed = (frozen_size_ + headroom - 1) / headroom;
-    return std::max<size_t>(kBaseDrainBudget, needed);
-  }
-
   void reset_active() {
     pgm_active_ = PGM(params_);
     bloom_active_.clear();
@@ -161,6 +164,14 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     frozen_drain_cursor_ = 0;
   }
 
+  // Materializes the drain ferry vector AND seeds the global prefilter with
+  // every key in the frozen DPGM, all in one foreground pass. The prefilter
+  // update happens here (not in the worker) to avoid a foreground-read /
+  // worker-write data race on the Bloom bits. After this returns, the
+  // prefilter conservatively reports "maybe in LIPP" for every key in the
+  // current frozen DPGM, even before the worker has actually drained them
+  // into LIPP. Lookups of those keys still find them in pgm_frozen_ (which
+  // outlives the drain) so correctness is preserved.
   void build_frozen_drain_from_pgm() {
     frozen_drain_.clear();
     frozen_drain_.reserve(frozen_size_);
@@ -169,11 +180,16 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
       kv.key = k;
       kv.value = v;
       frozen_drain_.push_back(kv);
+      if (kEnablePrefilter) {
+        prefilter_.add(static_cast<uint64_t>(k));
+      }
     });
     frozen_drain_cursor_ = 0;
   }
 
-  void rebuild_lipp_from_lipp() {
+  // Bulk-rebuild LIPP in place from its own current keys. Called from the
+  // worker (which already holds unique_lock(lipp_mtx_) when it invokes this).
+  void rebuild_lipp_from_lipp_locked() {
     std::vector<std::pair<KeyType, uint64_t>> sorted_kvs;
     sorted_kvs.reserve(total_size_);
     lipp.for_each_leaf_kv([&sorted_kvs](const KeyType& k, uint64_t v) {
@@ -182,37 +198,91 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     lipp.rebuild_from_sorted_kvs(sorted_kvs);
   }
 
-  void drain_some(size_t budget, uint32_t thread_id) {
-    if (frozen_size_ == 0) return;
-    while (budget > 0 && frozen_drain_cursor_ < frozen_drain_.size()) {
-      const auto& kv = frozen_drain_[frozen_drain_cursor_];
-      lipp.Insert(kv, thread_id);
-      // Key now lives in LIPP, so it joins the global prefilter.
-      if (kEnablePrefilter) {
-        prefilter_.add(static_cast<uint64_t>(kv.key));
+  // (E) Background worker entry point. Waits for a frozen drain to arrive,
+  // then pushes keys into LIPP one batch at a time under lipp_mtx_.
+  // Exits immediately on stop_, even if a drain is mid-flight (the index is
+  // being destroyed, so any not-yet-drained keys are discarded along with it).
+  void worker_main() {
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lk(worker_mtx_);
+        worker_cv_.wait(lk, [this]() {
+          return stop_.load(std::memory_order_acquire) ||
+                 !drain_done_.load(std::memory_order_acquire);
+        });
+        if (stop_.load(std::memory_order_acquire)) {
+          return;
+        }
       }
-      ++frozen_drain_cursor_;
-      --budget;
-    }
-    if (frozen_drain_cursor_ >= frozen_drain_.size()) {
-      reset_frozen_empty();
-      ++drains_since_rebuild_;
-      if (drains_since_rebuild_ >= kRebuildEveryDrains) {
-        rebuild_lipp_from_lipp();
-        drains_since_rebuild_ = 0;
+
+      while (!stop_.load(std::memory_order_acquire) &&
+             frozen_drain_cursor_ < frozen_drain_.size()) {
+        const size_t end = std::min(
+            frozen_drain_cursor_ + kWorkerBatchSize, frozen_drain_.size());
+        {
+          // Single-writer / multi-reader on LIPP: take unique here, foreground
+          // lookups take shared in EqualityLookup. The prefilter is NOT
+          // updated here (see build_frozen_drain_from_pgm).
+          std::unique_lock<std::shared_mutex> lk(lipp_mtx_);
+          for (size_t i = frozen_drain_cursor_; i < end; ++i) {
+            lipp.Insert(frozen_drain_[i], 0);
+          }
+          frozen_drain_cursor_ = end;
+        }
+      }
+
+      if (frozen_drain_cursor_ >= frozen_drain_.size()) {
+        ++drains_since_rebuild_;
+        if (drains_since_rebuild_ >= kRebuildEveryDrains) {
+          std::unique_lock<std::shared_mutex> lk(lipp_mtx_);
+          rebuild_lipp_from_lipp_locked();
+          drains_since_rebuild_ = 0;
+        }
+        // Signal foreground that drain is done. The release store publishes
+        // all worker-side LIPP writes to any subsequent acquire load.
+        drain_done_.store(true, std::memory_order_release);
       }
     }
   }
 
+  // Wait until the worker has finished any in-flight drain. Cheap when the
+  // worker is idle (single atomic load).
+  void wait_for_drain_done() {
+    while (!drain_done_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }
+
   void try_swap_active_to_frozen() {
-    if (frozen_size_ != 0) return;
+    // Foreground does not enter unless drain is done; this is the precondition.
     pgm_frozen_ = std::move(pgm_active_);
     bloom_frozen_ = std::move(bloom_active_);
     min_frozen_ = min_active_;
     max_frozen_ = max_active_;
     frozen_size_ = active_size_;
     build_frozen_drain_from_pgm();
+    // Reset active for new inserts BEFORE waking the worker so the foreground
+    // can keep accepting inserts immediately while the worker drains.
     reset_active();
+    {
+      // Set the cv predicate under the worker's mutex to avoid the textbook
+      // missed-wakeup race against a worker that's about to call cv.wait.
+      std::lock_guard<std::mutex> lk(worker_mtx_);
+      drain_done_.store(false, std::memory_order_release);
+    }
+    worker_cv_.notify_one();
+  }
+
+  // Stop and join the worker. Must be called before the dtor returns.
+  void stop_worker() {
+    {
+      std::lock_guard<std::mutex> lk(worker_mtx_);
+      stop_.store(true, std::memory_order_release);
+    }
+    worker_cv_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
   }
 
  public:
@@ -233,16 +303,25 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
         permille_override_ = std::min(5000, p1);
       }
     }
+    drain_done_.store(true, std::memory_order_release);
+    stop_.store(false, std::memory_order_release);
+    worker_ = std::thread(&HybridPGMLippAdv::worker_main, this);
   }
 
+  ~HybridPGMLippAdv() { stop_worker(); }
+
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
+    // Drain any leftover work from a previous Build (worker is alive across
+    // the harness's per-repeat reconstructions, but in this design ctor is
+    // called fresh per repeat so this is just defense in depth).
+    wait_for_drain_done();
+
     total_size_ = data.size();
     active_cap_ = compute_active_cap(total_size_);
     reset_active();
     reset_frozen_empty();
     drains_since_rebuild_ = 0;
 
-    // (C) Seed the global prefilter from the bulk-loaded LIPP population.
     prefilter_.clear();
     if (kEnablePrefilter) {
       prefilter_.init(prefilter_capacity(total_size_), k_prefilter_fp);
@@ -251,19 +330,33 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
       }
     }
 
-    return lipp.Build(data, num_threads);
+    // Worker is asleep (drain_done_ == true); safe to call lipp.Build without
+    // holding lipp_mtx_. Take it anyway for paranoia.
+    uint64_t build_time;
+    {
+      std::unique_lock<std::shared_mutex> lk(lipp_mtx_);
+      build_time = lipp.Build(data, num_threads);
+    }
+    return build_time;
   }
 
-  // (C)+(D) Lookup with global LIPP prefilter.
-  //
-  //   If prefilter says "definitely not in LIPP", probe active+frozen DPGMs.
-  //   Otherwise probe LIPP first; on a LIPP miss, fall through to the DPGMs.
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
     const bool maybe_in_lipp =
         !kEnablePrefilter ||
         prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
     if (maybe_in_lipp) {
-      const size_t v = lipp.EqualityLookup(lookup_key, thread_id);
+      // Skip the shared_lock when no drain is in flight: the worker is asleep
+      // on the cv and is not writing LIPP. drain_done_ uses acquire ordering
+      // so any worker writes prior to drain_done_=true are visible here.
+      const bool worker_idle =
+          drain_done_.load(std::memory_order_acquire);
+      size_t v;
+      if (worker_idle) {
+        v = lipp.EqualityLookup(lookup_key, thread_id);
+      } else {
+        std::shared_lock<std::shared_mutex> lk(lipp_mtx_);
+        v = lipp.EqualityLookup(lookup_key, thread_id);
+      }
       if (v != util::NOT_FOUND) return v;
     }
     if (active_size_ > 0 &&
@@ -287,8 +380,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-    drain_some(drain_budget(), thread_id);
-
     pgm_active_.Insert(data, thread_id);
     bloom_active_.add(static_cast<uint64_t>(data.key));
     if (data.key < min_active_) min_active_ = data.key;
@@ -297,14 +388,12 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     ++total_size_;
 
     if (active_size_ >= active_cap_) {
-      if (frozen_size_ == 0) {
-        try_swap_active_to_frozen();
-      } else {
-        drain_some(active_cap_, thread_id);
-        if (frozen_size_ == 0) {
-          try_swap_active_to_frozen();
-        }
-      }
+      // Wait for any in-flight drain to finish before swapping. With
+      // active_cap_ much smaller than total ops the second wait would be
+      // a real stall, but with the default 4 MiB cap on these benchmarks
+      // the swap fires zero or one times so the wait is essentially free.
+      wait_for_drain_done();
+      try_swap_active_to_frozen();
     }
   }
 
