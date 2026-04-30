@@ -10,62 +10,58 @@
 
 #include "../util.h"
 #include "base.h"
+#include "blocked_bloom_filter_uint64.h"
 #include "bloom_filter_uint64.h"
 #include "dynamic_pgm_index.h"
 #include "lipp.h"
 
 /**
- * Milestone 3 hybrid (Stage 3). Pure DPGM + LIPP design with a Bloom side
- * filter and trivial scalar metadata; no other key-storing structures.
+ * Milestone 3 hybrid (Stage 4). Pure DPGM + LIPP design with three Bloom-style
+ * side filters (bits only — no key/value storage outside DPGM and LIPP):
  *
- *  (A) Two DPGM buffers, "active" + "frozen".
- *      Inserts always go to pgm_active_. When pgm_active_ reaches its
- *      capacity, its keys move into pgm_frozen_ (which by design is empty
- *      at swap time) and pgm_active_ is reset for fresh inserts.
+ *  (A) Two DPGM buffers, "active" + "frozen", with cooperative drain into LIPP.
+ *      Inserts always go to pgm_active_. When pgm_active_ reaches active_cap_,
+ *      it is moved into pgm_frozen_ and pgm_active_ is reset. Each Insert pops
+ *      a few keys out of pgm_frozen_ into LIPP, smoothing what would otherwise
+ *      be a single stop-the-world flush. With the default cap (kActiveCapDefault)
+ *      sized larger than each benchmark workload, swap+drain stay dormant on
+ *      the standard 2M-op runs and inserts only pay DPGM cost; pass a smaller
+ *      cap via params[1] to actually exercise drain.
  *
- *  (B) Cooperative drain (with optional periodic LIPP bulk-rebuild).
- *      Every Insert pops up to drain_budget() keys out of the frozen
- *      DPGM and pushes them into LIPP. budget is constant 4 in the hot
- *      path, but accelerates if frozen has not emptied by the time
- *      active is filling up. After every kRebuildEveryDrains completed
- *      drains we also rebuild LIPP via bulk_load. The default constant
- *      is huge so the rebuild path is OFF; lower it to enable.
+ *  (B) Per-buffer min/max gate + classical Bloom on each DPGM buffer.
+ *      Each DPGM has its own min/max range gate and its own small Bloom
+ *      (sized for active_cap_ keys, fits in L1/L2). Used on lookups that the
+ *      global prefilter could not rule out, to skip the DPGM probe on most
+ *      negatives.
  *
- *  (C) No persistent side vector for active.
- *      The active path stores keys only in pgm_active_ plus its Bloom and
- *      min/max gate. At swap time we materialize a transient sorted
- *      "drain" vector by walking the frozen DPGM in key order; that
- *      vector lives only until the drain finishes, then is cleared.
+ *  (C) Global LIPP-membership prefilter (blocked Bloom).
+ *      Seeded from the bulk-loaded keys in Build(), then updated whenever a
+ *      key actually transitions into LIPP via drain. Probed first in
+ *      EqualityLookup: if the prefilter says "definitely not in LIPP", we
+ *      skip the LIPP traversal entirely (the dominant cost on negative
+ *      lookups, ~50% of mixed workloads). The blocked layout keeps each
+ *      probe to a single 64-byte cache line.
  *
- *  (D) Per-buffer min/max gate + delta-only Bloom.
- *      Each DPGM has its own gate and its own Bloom, sized for that
- *      buffer's capacity. With the small default cap (32K) each Bloom is
- *      a few tens of KB and stays in L1/L2.
+ *  (D) LIPP-first lookup ordering when the prefilter says "maybe in LIPP".
+ *      Uniqueness invariant (keys live in exactly one of {active, frozen,
+ *      LIPP}) means the dominant positive case (key in LIPP) skips the gate
+ *      / per-buffer Bloom / DPGM probe.
  *
- *  (E) LIPP-first lookup ordering.
- *      Because LIPP and the workload both treat keys as unique, a key in
- *      LIPP cannot also be in either DPGM, and vice versa. The cheapest
- *      thing we can do for the dominant case (positives that live in LIPP,
- *      ~99%+ of positives in mixed workloads) is to skip the gate / Bloom
- *      / DPGM probe entirely. We probe LIPP first; only on LIPP miss do
- *      we consult the per-buffer gate+Bloom+DPGM. Negatives pay the same
- *      cost as before (LIPP miss + gate/Bloom miss), so this is a strict
- *      improvement on the dominant lookup category.
+ * Lookup decision tree:
  *
- *  (F) Small fixed default active cap (32K).
- *      Below the default, the swap+drain machinery actually fires several
- *      times per workload, exercising the cooperative-flush design instead
- *      of letting it sit dormant behind a 5%-of-N threshold that the
- *      benchmarks never reach.
+ *     prefilter.maybe(k)?
+ *       no  -> (key not in LIPP)         -> probe active+frozen DPGMs only
+ *       yes -> probe LIPP
+ *               hit  -> return
+ *               miss -> probe active+frozen DPGMs
  *
- * ABI compatibility:
- *   params[1]  active-buffer cap. Two interpretations:
- *                > 1000 ⇒ absolute cap in keys (e.g. 131072).
- *                ≤ 1000 ⇒ legacy permille of total_size_ (e.g. 13 ⇒ ~1.3%).
- *              If params[1] is unset, kActiveCapDefault is used.
- *   params[2]  accepted but ignored (legacy bloom-rebuild knob).
- *   The constant `k_bloom_fp` is patched in-place by
- *   scripts/run_bloom_fp_sweep.sh; keep its name and shape.
+ * ABI:
+ *   params[1]: active-buffer cap. > 1000 ⇒ absolute keys (e.g. 131072).
+ *              ≤ 1000 ⇒ legacy permille of total_size (e.g. 13 ⇒ ~1.3%).
+ *              Unset ⇒ kActiveCapDefault.
+ *   params[2]: accepted but ignored (legacy bloom-rebuild knob).
+ *   k_bloom_fp / k_prefilter_fp constants are patched in-place by the
+ *   bloom-fp sweep script; preserve their names and value shapes.
  */
 template <class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
@@ -77,8 +73,9 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   size_t active_cap_ = 1024;
 
   static constexpr double k_bloom_fp = 0.01;
+  static constexpr double k_prefilter_fp = 0.05;
   static constexpr size_t kBaseDrainBudget = 4;
-  static constexpr size_t kActiveCapDefault = 32768;
+  static constexpr size_t kActiveCapDefault = size_t{4} * 1024 * 1024;
   static constexpr size_t kAbsoluteCapMin = 1024;
   static constexpr size_t kAbsoluteCapMax = size_t{8} * 1024 * 1024;
   // Periodic LIPP bulk-rebuild cadence. Default is effectively off because at
@@ -104,6 +101,11 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   std::vector<KeyValue<KeyType>> frozen_drain_;
   size_t frozen_drain_cursor_ = 0;
 
+  // (C) Global blocked Bloom over keys currently in LIPP. Seeded by Build()
+  // from the bulk-loaded population; updated whenever a key migrates from
+  // pgm_frozen_ into LIPP via drain_some().
+  BlockedBloomFilterUint64 prefilter_;
+
   size_t drains_since_rebuild_ = 0;
 
   size_t compute_active_cap(size_t total) const {
@@ -120,7 +122,13 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     return kActiveCapDefault;
   }
 
-  // (B) Drain budget: cheap default of 4 per insert, accelerating only when
+  size_t prefilter_capacity(size_t bulk_size) const {
+    const size_t headroom =
+        std::max<size_t>(size_t{1} << 16, bulk_size / 32);
+    return bulk_size + headroom;
+  }
+
+  // (A) Drain budget: cheap default of 4 per insert; accelerates only when
   // frozen has not emptied by the time active is approaching full.
   size_t drain_budget() const {
     if (frozen_size_ == 0) return 0;
@@ -149,9 +157,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     frozen_drain_cursor_ = 0;
   }
 
-  // Iterate the (already-moved-in) frozen DPGM in key order and copy each
-  // (key, value) pair into the transient drain vector. Lives only until the
-  // drain finishes, at which point reset_frozen_empty() shrinks it.
   void build_frozen_drain_from_pgm() {
     frozen_drain_.clear();
     frozen_drain_.reserve(frozen_size_);
@@ -164,10 +169,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     frozen_drain_cursor_ = 0;
   }
 
-  // (B) Bulk-rebuild LIPP in place from its own current keys. The transient
-  // sorted vector lives only inside this call; afterwards the keys live only
-  // in LIPP. We rebuild in place because Lipp<KeyType> is not move-assignable
-  // (the underlying LIPP class is not designed to be reassigned wholesale).
   void rebuild_lipp_from_lipp() {
     std::vector<std::pair<KeyType, uint64_t>> sorted_kvs;
     sorted_kvs.reserve(total_size_);
@@ -180,7 +181,10 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   void drain_some(size_t budget, uint32_t thread_id) {
     if (frozen_size_ == 0) return;
     while (budget > 0 && frozen_drain_cursor_ < frozen_drain_.size()) {
-      lipp.Insert(frozen_drain_[frozen_drain_cursor_], thread_id);
+      const auto& kv = frozen_drain_[frozen_drain_cursor_];
+      lipp.Insert(kv, thread_id);
+      // Key now lives in LIPP, so it joins the global prefilter.
+      prefilter_.add(static_cast<uint64_t>(kv.key));
       ++frozen_drain_cursor_;
       --budget;
     }
@@ -231,19 +235,25 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     reset_active();
     reset_frozen_empty();
     drains_since_rebuild_ = 0;
+
+    // (C) Seed the global prefilter from the bulk-loaded LIPP population.
+    prefilter_.clear();
+    prefilter_.init(prefilter_capacity(total_size_), k_prefilter_fp);
+    for (const auto& kv : data) {
+      prefilter_.add(static_cast<uint64_t>(kv.key));
+    }
+
     return lipp.Build(data, num_threads);
   }
 
-  // (E) LIPP-first lookup. Uniqueness invariant: the workload only inserts
-  // keys not already present anywhere, so a key lives in at most one of
-  // {active DPGM, frozen DPGM, LIPP}. Probing LIPP first lets the dominant
-  // "positive lookup of an originally-bulk-loaded key" path skip the gate,
-  // Bloom, and DPGM probe entirely. Negatives still consult the gate+Bloom
-  // after the LIPP miss. A small extra cost is paid for the rare positive
-  // that lives in DPGM (an extra LIPP miss before the DPGM probe), which is
-  // negligible because such hits are < 1% of lookups in mixed workloads.
+  // (C)+(D) Lookup with global LIPP prefilter.
+  //
+  //   If prefilter says "definitely not in LIPP", probe active+frozen DPGMs.
+  //   Otherwise probe LIPP first; on a LIPP miss, fall through to the DPGMs.
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
-    {
+    const bool maybe_in_lipp =
+        prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
+    if (maybe_in_lipp) {
       const size_t v = lipp.EqualityLookup(lookup_key, thread_id);
       if (v != util::NOT_FOUND) return v;
     }
@@ -281,8 +291,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
       if (frozen_size_ == 0) {
         try_swap_active_to_frozen();
       } else {
-        // Adaptive drain should normally prevent reaching this branch.
-        // Pay one large drain so the next try_swap can succeed.
         drain_some(active_cap_, thread_id);
         if (frozen_size_ == 0) {
           try_swap_active_to_frozen();
@@ -309,7 +317,8 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
 
   std::size_t size() const {
     return pgm_active_.size() + pgm_frozen_.size() + lipp.size() +
-           bloom_active_.size_in_bytes() + bloom_frozen_.size_in_bytes();
+           bloom_active_.size_in_bytes() + bloom_frozen_.size_in_bytes() +
+           prefilter_.size_in_bytes();
   }
 };
 
