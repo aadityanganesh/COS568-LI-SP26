@@ -115,6 +115,25 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
 
   BlockedBloomFilterUint64 prefilter_;
 
+  // (F) Stage 6 — LIPP-membership range gate.
+  // Two cached scalars covering the bulk-loaded keys plus everything that has
+  // since transitioned (or is in the process of transitioning) into LIPP via
+  // a frozen-buffer drain. Probed BEFORE the prefilter / LIPP traversal in
+  // EqualityLookup to short-circuit out-of-range negatives in ~3 ns.
+  //
+  // Update points (foreground-only, no worker writes):
+  //   Build():               set to data.front()/data.back() (sorted bulk).
+  //   try_swap_active_to_frozen(): widen to include the new frozen buffer
+  //                                (the worker is about to drain those keys
+  //                                into LIPP, but lookups against them must
+  //                                already pass the gate or we'd miss them
+  //                                in pgm_frozen_'s tail of the lookup tree).
+  //
+  // Read points: EqualityLookup (foreground-only). Single-threaded foreground
+  // means no atomics needed.
+  KeyType lipp_min_ = std::numeric_limits<KeyType>::max();
+  KeyType lipp_max_ = std::numeric_limits<KeyType>::lowest();
+
   size_t drains_since_rebuild_ = 0;
 
   // (E) Worker / async-drain state.
@@ -261,6 +280,13 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     max_frozen_ = max_active_;
     frozen_size_ = active_size_;
     build_frozen_drain_from_pgm();
+    // (F) Widen the LIPP range gate BEFORE the worker can begin draining.
+    // Once the gate is widened, lookups in [min_frozen_, max_frozen_] will
+    // correctly fall through to the LIPP probe and (on miss) to pgm_frozen_.
+    if (frozen_size_ > 0) {
+      if (min_frozen_ < lipp_min_) lipp_min_ = min_frozen_;
+      if (max_frozen_ > lipp_max_) lipp_max_ = max_frozen_;
+    }
     // Reset active for new inserts BEFORE waking the worker so the foreground
     // can keep accepting inserts immediately while the worker drains.
     reset_active();
@@ -322,6 +348,26 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     reset_frozen_empty();
     drains_since_rebuild_ = 0;
 
+    // (F) Seed the LIPP range gate from the bulk data. LIPP requires sorted
+    // input for bulk_load (otherwise it would have already failed), so
+    // data.front()/back() are min/max. For absolute safety on the OFF-CHANCE
+    // the dataset is unsorted, fall back to an O(N) scan.
+    if (!data.empty()) {
+      lipp_min_ = data.front().key;
+      lipp_max_ = data.back().key;
+      if (lipp_min_ > lipp_max_) {
+        lipp_min_ = std::numeric_limits<KeyType>::max();
+        lipp_max_ = std::numeric_limits<KeyType>::lowest();
+        for (const auto& kv : data) {
+          if (kv.key < lipp_min_) lipp_min_ = kv.key;
+          if (kv.key > lipp_max_) lipp_max_ = kv.key;
+        }
+      }
+    } else {
+      lipp_min_ = std::numeric_limits<KeyType>::max();
+      lipp_max_ = std::numeric_limits<KeyType>::lowest();
+    }
+
     prefilter_.clear();
     if (kEnablePrefilter) {
       prefilter_.init(prefilter_capacity(total_size_), k_prefilter_fp);
@@ -341,9 +387,17 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+    // (F) LIPP range gate: two scalar compares (~3 ns, fully L1-resident).
+    // Any key outside [lipp_min_, lipp_max_] is definitely not in LIPP and
+    // we skip the LIPP probe (and the prefilter probe) entirely. Used as a
+    // standalone LIPP precheck when the prefilter is off, and as a free
+    // bypass on top of the prefilter when it's on.
+    const bool in_lipp_range =
+        lookup_key >= lipp_min_ && lookup_key <= lipp_max_;
     const bool maybe_in_lipp =
-        !kEnablePrefilter ||
-        prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
+        in_lipp_range &&
+        (!kEnablePrefilter ||
+         prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key)));
     if (maybe_in_lipp) {
       // Skip the shared_lock when no drain is in flight: the worker is asleep
       // on the cv and is not writing LIPP. drain_done_ uses acquire ordering
