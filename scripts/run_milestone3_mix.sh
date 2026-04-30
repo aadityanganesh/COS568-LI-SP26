@@ -4,9 +4,9 @@
 # Run from repo root after build. Uses -r 3 per README.
 set -euo pipefail
 
-BENCHMARK=build/benchmark
+BENCHMARK="${BENCHMARK:-build/benchmark}"
 if [[ ! -f "$BENCHMARK" ]]; then
-  echo "benchmark binary missing; run scripts/build_benchmark.sh first"
+  echo "benchmark binary missing at ${BENCHMARK}; run scripts/build_benchmark.sh first"
   exit 1
 fi
 
