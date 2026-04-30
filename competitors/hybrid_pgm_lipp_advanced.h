@@ -82,6 +82,10 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   // 100M / 2M-op benchmarks an O(n) rebuild dominates the run; lower this to
   // experiment with rebuild-driven LIPP compaction.
   static constexpr size_t kRebuildEveryDrains = (size_t{1} << 30);
+  // (C) Global LIPP-membership prefilter on/off. Patched by
+  // scripts/run_prefilter_ab.sh; preserve name and the literal "true"/"false"
+  // value so the sed-flip script can find it.
+  static constexpr bool kEnablePrefilter = true;
 
   // Cap configuration parsed from params[1]; see compute_active_cap().
   size_t absolute_cap_override_ = 0;
@@ -184,7 +188,9 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
       const auto& kv = frozen_drain_[frozen_drain_cursor_];
       lipp.Insert(kv, thread_id);
       // Key now lives in LIPP, so it joins the global prefilter.
-      prefilter_.add(static_cast<uint64_t>(kv.key));
+      if (kEnablePrefilter) {
+        prefilter_.add(static_cast<uint64_t>(kv.key));
+      }
       ++frozen_drain_cursor_;
       --budget;
     }
@@ -238,9 +244,11 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
 
     // (C) Seed the global prefilter from the bulk-loaded LIPP population.
     prefilter_.clear();
-    prefilter_.init(prefilter_capacity(total_size_), k_prefilter_fp);
-    for (const auto& kv : data) {
-      prefilter_.add(static_cast<uint64_t>(kv.key));
+    if (kEnablePrefilter) {
+      prefilter_.init(prefilter_capacity(total_size_), k_prefilter_fp);
+      for (const auto& kv : data) {
+        prefilter_.add(static_cast<uint64_t>(kv.key));
+      }
     }
 
     return lipp.Build(data, num_threads);
@@ -252,6 +260,7 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   //   Otherwise probe LIPP first; on a LIPP miss, fall through to the DPGMs.
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
     const bool maybe_in_lipp =
+        !kEnablePrefilter ||
         prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
     if (maybe_in_lipp) {
       const size_t v = lipp.EqualityLookup(lookup_key, thread_id);
