@@ -26,6 +26,47 @@ export PATH="/usr/bin:/bin:/usr/local/bin:${PATH:-}"
 
 module purge
 module load gcc/11 boost/1.85.0
+MODULE_PATH="$PATH"
+
+# Resolve cmake on the compute node, same logic as scripts/login_milestone3_prep.sh.
+# Necessary because run_prefilter_ab.sh rebuilds twice from inside this Slurm job.
+if [[ -x /usr/bin/cmake ]]; then
+  export PATH="/usr/bin:${MODULE_PATH}"
+else
+  if ! module load anaconda3/2023.3; then
+    echo "ERROR: module load anaconda3/2023.3 failed."
+    exit 1
+  fi
+  ANACONDA_ROOT="${CONDA_PREFIX:-/usr/licensed/anaconda3/2023.3}"
+  if [[ -f "${ANACONDA_ROOT}/etc/profile.d/conda.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${ANACONDA_ROOT}/etc/profile.d/conda.sh"
+  fi
+  COS568_CMAKE=""
+  if conda activate cos568 2>/dev/null; then
+    if [[ -x "${CONDA_PREFIX}/bin/cmake" ]]; then
+      COS568_CMAKE="${CONDA_PREFIX}/bin/cmake"
+    fi
+  fi
+  if [[ -z "${COS568_CMAKE}" ]]; then
+    for ENV_ROOT in "${HOME}/.conda/envs/cos568" "${ANACONDA_ROOT}/envs/cos568"; do
+      if [[ -x "${ENV_ROOT}/bin/cmake" ]]; then
+        COS568_CMAKE="${ENV_ROOT}/bin/cmake"
+        break
+      fi
+    done
+  fi
+  if [[ -z "${COS568_CMAKE}" ]] || [[ ! -x "${COS568_CMAKE}" ]]; then
+    echo "ERROR: No usable cmake found on compute node."
+    conda env list 2>&1 || true
+    exit 1
+  fi
+  export PATH="$(dirname "${COS568_CMAKE}"):${MODULE_PATH}"
+fi
+
+echo "=== cmake / gcc check ==="
+command -v cmake
+command -v gcc
 
 chmod +x scripts/*.sh 2>/dev/null || true
 
