@@ -9,10 +9,7 @@ Per mix × dataset:
   - Throughput (median of 3 repeats): LIPP, HybridPGMLippAdv, DynamicPGM
   - Index size (bytes from CSV): same three indexes
 
-One representative PGM/search variant per index type (best median throughput
-for DPGM and Adv on that dataset in that run). See GOOD_RUN_META below.
-
-Output: docs/milestone3_good_run/*.png and tables_good_run.md (tracked in git).
+Output: report_results/milestone3_good_run/*.png and tables_good_run.md
 
 Requires: pip install matplotlib
 """
@@ -22,7 +19,6 @@ import os
 import sys
 
 # --- "Good run" medians (median of mixed_throughput_mops1..3) and index sizes ---
-# Sizes are bytes from the benchmark CSV. Throughput in M ops/s.
 GOOD_RUN = {
     "10pct_insert": {
         "books": {
@@ -143,9 +139,9 @@ def main() -> int:
         print("Install matplotlib:  pip install matplotlib", file=sys.stderr)
         return 1
 
+    # repo/report_results/this_script.py -> repo root is two levels up
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    # Under docs/ so PNGs are not dropped by root .gitignore (*.png).
-    out_dir = os.path.join(root, "docs", "milestone3_good_run")
+    out_dir = os.path.join(root, "report_results", "milestone3_good_run")
     os.makedirs(out_dir, exist_ok=True)
 
     mix_keys = [
@@ -157,7 +153,6 @@ def main() -> int:
         block = GOOD_RUN[mix_key]
         for ds in ("books", "fb", "osmc"):
             data = block[ds]
-            # Throughput
             fig, ax = plt.subplots(figsize=(7.5, 4.5))
             names = [LABELS[k] for k in ORDER]
             vals = [data[k]["mops"] for k in ORDER]
@@ -183,13 +178,10 @@ def main() -> int:
             )
             fig.text(0.5, 0.02, foot, ha="center", fontsize=8, style="italic")
             plt.tight_layout(rect=(0, 0.08, 1, 1))
-            tp_path = os.path.join(
-                out_dir, f"{fname_prefix}_{ds}_throughput.png"
-            )
+            tp_path = os.path.join(out_dir, f"{fname_prefix}_{ds}_throughput.png")
             fig.savefig(tp_path, dpi=150)
             plt.close(fig)
 
-            # Index size
             fig2, ax2 = plt.subplots(figsize=(7.5, 4.5))
             sizes_gb = [bytes_to_gb(data[k]["size"]) for k in ORDER]
             bars2 = ax2.bar(names, sizes_gb, color=colors, edgecolor="#333", linewidth=0.8)
@@ -210,7 +202,6 @@ def main() -> int:
             fig2.savefig(sz_path, dpi=150)
             plt.close(fig2)
 
-    # Markdown summary table
     md_path = os.path.join(out_dir, "tables_good_run.md")
     lines = [
         "# Milestone 3 good run — summary tables",
@@ -248,9 +239,9 @@ def main() -> int:
         f.write("\n".join(lines))
 
     print(f"Wrote 12 PNGs and {md_path}")
-    for f in sorted(os.listdir(out_dir)):
-        if f.endswith(".png"):
-            print(f"  {os.path.join(out_dir, f)}")
+    for fn in sorted(os.listdir(out_dir)):
+        if fn.endswith(".png"):
+            print(f"  {os.path.join(out_dir, fn)}")
     return 0
 
 
