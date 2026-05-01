@@ -10,6 +10,7 @@ Per mix × dataset:
   - Index size: same three indexes (bytes from CSV)
 
 Output: report_results/milestone3_good_run/*.png and tables_good_run.md
+        (12 markdown tables, one per PNG figure).
 
 Requires: pip install matplotlib
 """
@@ -147,41 +148,57 @@ def main() -> int:
 
     md_path = os.path.join(out_dir, "tables_good_run.md")
     lines = [
-        "# Milestone 3 — summary tables",
+        "# Milestone 3 — tables (one per figure)",
         "",
+        "Each section matches one bar chart in this folder (`*.png`). "
         "Mixed workload benchmark (Adroit, Stage 5 hybrid).",
         "",
-        "## 10% insert / 90% lookup",
-        "",
-        "| Dataset | LIPP Mops/s | Adv Mops/s | DPGM Mops/s | LIPP GB | Adv GB | DPGM GB |",
-        "|---------|------------:|-----------:|------------:|--------:|-------:|--------:|",
     ]
-    for ds in ("books", "fb", "osmc"):
-        d = GOOD_RUN["10pct_insert"][ds]
-        lines.append(
-            f"| {ds} | {d['LIPP']['mops']:.3f} | {d['HybridPGMLippAdv']['mops']:.3f} | {d['DynamicPGM']['mops']:.3f} | "
-            f"{bytes_to_gb(d['LIPP']['size']):.2f} | {bytes_to_gb(d['HybridPGMLippAdv']['size']):.2f} | {bytes_to_gb(d['DynamicPGM']['size']):.2f} |"
+
+    def table_throughput(stem: str, mix_human: str, ds_title: str, d: dict) -> None:
+        lines.extend(
+            [
+                f"## `{stem}_throughput.png`",
+                "",
+                f"**{ds_title}** — {mix_human}",
+                "",
+                "| Index | Throughput (M ops/s) |",
+                "|-------|---------------------:|",
+                f"| LIPP | {d['LIPP']['mops']:.3f} |",
+                f"| HybridPGMLippAdv | {d['HybridPGMLippAdv']['mops']:.3f} |",
+                f"| DynamicPGM | {d['DynamicPGM']['mops']:.3f} |",
+                "",
+            ]
         )
-    lines.extend(
-        [
-            "",
-            "## 90% insert / 10% lookup",
-            "",
-            "| Dataset | LIPP Mops/s | Adv Mops/s | DPGM Mops/s | LIPP GB | Adv GB | DPGM GB |",
-            "|---------|------------:|-----------:|------------:|--------:|-------:|--------:|",
-        ]
-    )
-    for ds in ("books", "fb", "osmc"):
-        d = GOOD_RUN["90pct_insert"][ds]
-        lines.append(
-            f"| {ds} | {d['LIPP']['mops']:.3f} | {d['HybridPGMLippAdv']['mops']:.3f} | {d['DynamicPGM']['mops']:.3f} | "
-            f"{bytes_to_gb(d['LIPP']['size']):.2f} | {bytes_to_gb(d['HybridPGMLippAdv']['size']):.2f} | {bytes_to_gb(d['DynamicPGM']['size']):.2f} |"
+
+    def table_size(stem: str, mix_human: str, ds_title: str, d: dict) -> None:
+        lines.extend(
+            [
+                f"## `{stem}_index_size.png`",
+                "",
+                f"**{ds_title}** — {mix_human}",
+                "",
+                "| Index | Size (GB) | Size (bytes) |",
+                "|-------|----------:|-------------:|",
+                f"| LIPP | {bytes_to_gb(d['LIPP']['size']):.2f} | {d['LIPP']['size']:,} |",
+                f"| HybridPGMLippAdv | {bytes_to_gb(d['HybridPGMLippAdv']['size']):.2f} | "
+                f"{d['HybridPGMLippAdv']['size']:,} |",
+                f"| DynamicPGM | {bytes_to_gb(d['DynamicPGM']['size']):.2f} | {d['DynamicPGM']['size']:,} |",
+                "",
+            ]
         )
-    lines.append("")
+
+    for mix_key, mix_title, fname_prefix in mix_keys:
+        block = GOOD_RUN[mix_key]
+        for ds in ("books", "fb", "osmc"):
+            stem = f"{fname_prefix}_{ds}"
+            table_throughput(stem, mix_title, DATASET_TITLES[ds], block[ds])
+            table_size(stem, mix_title, DATASET_TITLES[ds], block[ds])
+
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    print(f"Wrote 12 PNGs and {md_path}")
+    print(f"Wrote 12 PNGs, 12 tables in {md_path}")
     for fn in sorted(os.listdir(out_dir)):
         if fn.endswith(".png"):
             print(f"  {os.path.join(out_dir, fn)}")

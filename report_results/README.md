@@ -6,7 +6,7 @@ This folder holds **figures and tables** for the Milestone 3 writeup, generated 
 
 | Path | Description |
 |------|-------------|
-| `milestone3_good_run/` | 12 PNG bar charts + `tables_good_run.md` |
+| `milestone3_good_run/` | 12 PNG bar charts + `tables_good_run.md` (12 markdown tables, one per figure) |
 | `plot_milestone3_good_run.py` | Regenerates those files (requires `matplotlib`) |
 
 ## Regenerate plots
