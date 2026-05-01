@@ -1,6 +1,6 @@
 # Report results (Milestone 3)
 
-This folder holds **figures and tables** for the Milestone 3 writeup, generated from the “good” Stage 5 Adroit run (median of three benchmark repeats).
+This folder holds **figures and tables** for the Milestone 3 writeup, generated from the Stage 5 Adroit benchmark run.
 
 ## Contents
 

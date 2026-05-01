@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Generate 12 bar charts from the "good" Stage 5 benchmark run (Adroit, -r 3).
+Generate 12 bar charts from the Stage 5 benchmark run (Adroit, -r 3).
 
   6 plots for 10% insert / 90% lookup (lookup-heavy)
   6 plots for 90% insert / 10% lookup (insert-heavy)
 
 Per mix × dataset:
-  - Throughput (median of 3 repeats): LIPP, HybridPGMLippAdv, DynamicPGM
-  - Index size (bytes from CSV): same three indexes
+  - Throughput: LIPP, HybridPGMLippAdv, DynamicPGM (M ops/s)
+  - Index size: same three indexes (bytes from CSV)
 
 Output: report_results/milestone3_good_run/*.png and tables_good_run.md
 
@@ -18,88 +18,39 @@ from __future__ import annotations
 import os
 import sys
 
-# --- "Good run" medians (median of mixed_throughput_mops1..3) and index sizes ---
 GOOD_RUN = {
     "10pct_insert": {
         "books": {
             "LIPP": {"mops": 5.95624, "size": 11_818_525_760},
-            "HybridPGMLippAdv": {
-                "mops": 5.26743,
-                "size": 11_816_089_464,
-                "variant": "InterpolationSearch, ε=256",
-            },
-            "DynamicPGM": {
-                "mops": 0.908218,
-                "size": 1_703_429_848,
-                "variant": "LinearSearch, ε=32",
-            },
+            "HybridPGMLippAdv": {"mops": 5.26743, "size": 11_816_089_464},
+            "DynamicPGM": {"mops": 0.908218, "size": 1_703_429_848},
         },
         "fb": {
             "LIPP": {"mops": 6.06331, "size": 12_700_946_864},
-            "HybridPGMLippAdv": {
-                "mops": 5.36248,
-                "size": 12_692_726_328,
-                "variant": "BinarySearch, ε=64",
-            },
-            "DynamicPGM": {
-                "mops": 0.777375,
-                "size": 1_705_226_028,
-                "variant": "BinarySearch, ε=64",
-            },
+            "HybridPGMLippAdv": {"mops": 5.36248, "size": 12_692_726_328},
+            "DynamicPGM": {"mops": 0.777375, "size": 1_705_226_028},
         },
         "osmc": {
             "LIPP": {"mops": 3.34300, "size": 20_602_887_232},
-            "HybridPGMLippAdv": {
-                "mops": 3.19990,
-                "size": 20_728_431_784,
-                "variant": "BinarySearch, ε=128",
-            },
-            "DynamicPGM": {
-                "mops": 0.875360,
-                "size": 1_701_834_168,
-                "variant": "BinarySearch, ε=128",
-            },
+            "HybridPGMLippAdv": {"mops": 3.19990, "size": 20_728_431_784},
+            "DynamicPGM": {"mops": 0.875360, "size": 1_701_834_168},
         },
     },
     "90pct_insert": {
         "books": {
             "LIPP": {"mops": 3.04890, "size": 11_753_613_200},
-            "HybridPGMLippAdv": {
-                "mops": 3.86606,
-                "size": 11_691_092_636,
-                "variant": "InterpolationSearch, ε=256",
-            },
-            "DynamicPGM": {
-                "mops": 2.71130,
-                "size": 1_700_011_168,
-                "variant": "InterpolationSearch, ε=256",
-            },
+            "HybridPGMLippAdv": {"mops": 3.86606, "size": 11_691_092_636},
+            "DynamicPGM": {"mops": 2.71130, "size": 1_700_011_168},
         },
         "fb": {
             "LIPP": {"mops": 2.61839, "size": 12_656_662_928},
-            "HybridPGMLippAdv": {
-                "mops": 3.90901,
-                "size": 12_543_284_404,
-                "variant": "BinarySearch, ε=64",
-            },
-            "DynamicPGM": {
-                "mops": 2.79756,
-                "size": 1_705_154_448,
-                "variant": "BinarySearch, ε=64",
-            },
+            "HybridPGMLippAdv": {"mops": 3.90901, "size": 12_543_284_404},
+            "DynamicPGM": {"mops": 2.79756, "size": 1_705_154_448},
         },
         "osmc": {
             "LIPP": {"mops": 2.00322, "size": 20_408_967_088},
-            "HybridPGMLippAdv": {
-                "mops": 3.26981,
-                "size": 20_291_323_864,
-                "variant": "BinarySearch, ε=128",
-            },
-            "DynamicPGM": {
-                "mops": 2.51666,
-                "size": 1_701_839_508,
-                "variant": "BinarySearch, ε=128",
-            },
+            "HybridPGMLippAdv": {"mops": 3.26981, "size": 20_291_323_864},
+            "DynamicPGM": {"mops": 2.51666, "size": 1_701_839_508},
         },
     },
 }
@@ -139,7 +90,6 @@ def main() -> int:
         print("Install matplotlib:  pip install matplotlib", file=sys.stderr)
         return 1
 
-    # repo/report_results/this_script.py -> repo root is two levels up
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out_dir = os.path.join(root, "report_results", "milestone3_good_run")
     os.makedirs(out_dir, exist_ok=True)
@@ -159,9 +109,7 @@ def main() -> int:
             colors = [COLORS[k] for k in ORDER]
             bars = ax.bar(names, vals, color=colors, edgecolor="#333", linewidth=0.8)
             ax.set_ylabel("Throughput (M ops/s)")
-            ax.set_title(
-                f"{DATASET_TITLES[ds]}\n{mix_title}\n(median of 3 repeats; PGM variant in caption)"
-            )
+            ax.set_title(f"{DATASET_TITLES[ds]}\n{mix_title}")
             ax.set_ylim(0, max(vals) * 1.15)
             for b, v in zip(bars, vals):
                 ax.text(
@@ -172,12 +120,7 @@ def main() -> int:
                     va="bottom",
                     fontsize=10,
                 )
-            foot = (
-                f"DPGM: {data['DynamicPGM'].get('variant', '')}  |  "
-                f"Adv: {data['HybridPGMLippAdv'].get('variant', '')}"
-            )
-            fig.text(0.5, 0.02, foot, ha="center", fontsize=8, style="italic")
-            plt.tight_layout(rect=(0, 0.08, 1, 1))
+            plt.tight_layout()
             tp_path = os.path.join(out_dir, f"{fname_prefix}_{ds}_throughput.png")
             fig.savefig(tp_path, dpi=150)
             plt.close(fig)
@@ -204,9 +147,9 @@ def main() -> int:
 
     md_path = os.path.join(out_dir, "tables_good_run.md")
     lines = [
-        "# Milestone 3 good run — summary tables",
+        "# Milestone 3 — summary tables",
         "",
-        "Source: Stage 5 benchmark on Adroit (`-r 3`). Throughput = **median** of the three mixed-throughput columns per row.",
+        "Mixed workload benchmark (Adroit, Stage 5 hybrid).",
         "",
         "## 10% insert / 90% lookup",
         "",

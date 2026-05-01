@@ -1,6 +1,6 @@
-# Milestone 3 good run — summary tables
+# Milestone 3 — summary tables
 
-Source: Stage 5 benchmark on Adroit (`-r 3`). Throughput = **median** of the three mixed-throughput columns per row.
+Mixed workload benchmark (Adroit, Stage 5 hybrid).
 
 ## 10% insert / 90% lookup
 
