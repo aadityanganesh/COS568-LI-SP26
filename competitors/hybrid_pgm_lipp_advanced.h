@@ -95,35 +95,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   // and minimize lookup-side contention.
   static constexpr size_t kWorkerBatchSize = 256;
 
-  // (F) Stage 6 — adaptive mode switching.
-  //
-  // The default 4 MiB cap is sized so the active DPGM never rotates on a
-  // 2M-op workload. That is the right policy for insert-heavy mixes (90/10):
-  // inserts run pure DPGM, the worker stays asleep, no foreground stall on
-  // drain. It is the WRONG policy for lookup-heavy mixes (10/90): the active
-  // DPGM grows uninterrupted to ~200K keys, and every lookup that misses LIPP
-  // has to range-gate + Bloom-probe + (occasionally) DPGM-probe a
-  // monotonically-growing buffer.
-  //
-  // Adaptive policy: count ops over a small warmup window (kWarmupOps), pick
-  // a mode by insert ratio, and (only in lookup-heavy) shrink active_cap_ to
-  // kLookupHeavyActiveCap so the active stays small + cache-hot and the
-  // worker thread amortizes drain cost in parallel with lookups. Mode is set
-  // ONCE per Build (i.e. per benchmark repeat). It is never changed after
-  // that, so steady-state lookups pay only one cmp-and-branch on mode_.
-  //
-  // Foreground-only state: Insert (single-threaded foreground) and
-  // EqualityLookup (also single-threaded foreground) are the only writers;
-  // the worker thread does not touch any of these fields, so no atomics are
-  // needed.
-  enum class Mode : uint8_t { kUnknown, kLookupHeavy, kInsertHeavy };
-  static constexpr size_t kWarmupOps = 16384;
-  static constexpr double kInsertHeavyThresholdPct = 0.50;
-  static constexpr size_t kLookupHeavyActiveCap = size_t{64} * 1024;
-  mutable size_t warmup_ops_ = 0;
-  mutable size_t warmup_inserts_ = 0;
-  mutable Mode mode_ = Mode::kUnknown;
-
   // Cap configuration parsed from params[1]; see compute_active_cap().
   size_t absolute_cap_override_ = 0;
   int permille_override_ = 0;
@@ -172,31 +143,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     const size_t headroom =
         std::max<size_t>(size_t{1} << 16, bulk_size / 32);
     return bulk_size + headroom;
-  }
-
-  // (F) Adaptive mode finalization. Foreground-only — must NOT be called
-  // from a const method (it mutates active_cap_ and may trigger an immediate
-  // rotation on the next Insert). Idempotent: returns early once mode_ is
-  // set. Only shrinks active_cap_ when no explicit override was provided
-  // via params[1], so the existing A/B harness for the cap (params[1]>1000)
-  // continues to dominate.
-  void finalize_mode_foreground() {
-    if (mode_ != Mode::kUnknown) return;
-    const double insert_pct =
-        static_cast<double>(warmup_inserts_) /
-        static_cast<double>(std::max<size_t>(warmup_ops_, 1));
-    if (insert_pct >= kInsertHeavyThresholdPct) {
-      mode_ = Mode::kInsertHeavy;
-      // Default cap is already correct for insert-heavy (no rotation).
-    } else {
-      mode_ = Mode::kLookupHeavy;
-      if (absolute_cap_override_ == 0 && permille_override_ == 0) {
-        // Shrinking is safe even mid-run: the next Insert that pushes
-        // active_size_ past the new (smaller) cap triggers a rotation
-        // through try_swap_active_to_frozen() in the normal way.
-        active_cap_ = std::min(active_cap_, kLookupHeavyActiveCap);
-      }
-    }
   }
 
   void reset_active() {
@@ -375,12 +321,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     reset_active();
     reset_frozen_empty();
     drains_since_rebuild_ = 0;
-    // (F) Reset adaptive mode state per repeat. The harness reconstructs the
-    // index per repeat anyway, but Build() is the canonical "fresh start"
-    // and we want the observer to retrain on each fresh dataset.
-    mode_ = Mode::kUnknown;
-    warmup_ops_ = 0;
-    warmup_inserts_ = 0;
 
     prefilter_.clear();
     if (kEnablePrefilter) {
@@ -401,13 +341,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
   }
 
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
-    // (F) Adaptive observer: count lookups during warmup. We do NOT call
-    // finalize_mode_foreground() from here because it mutates active_cap_,
-    // and EqualityLookup is const. The next Insert (also foreground) will
-    // hit the warmup threshold and run finalization.
-    if (mode_ == Mode::kUnknown) {
-      ++warmup_ops_;
-    }
     const bool maybe_in_lipp =
         !kEnablePrefilter ||
         prefilter_.maybe_contains(static_cast<uint64_t>(lookup_key));
@@ -453,18 +386,6 @@ class HybridPGMLippAdv : public Competitor<KeyType, SearchClass> {
     if (data.key > max_active_) max_active_ = data.key;
     ++active_size_;
     ++total_size_;
-
-    // (F) Adaptive observer: count this insert; finalize mode once the
-    // warmup window completes. Finalization may shrink active_cap_, in
-    // which case the rotation below picks it up immediately on the next
-    // Insert (or this one, if active_size_ already exceeds the new cap).
-    if (mode_ == Mode::kUnknown) {
-      ++warmup_ops_;
-      ++warmup_inserts_;
-      if (warmup_ops_ >= kWarmupOps) {
-        finalize_mode_foreground();
-      }
-    }
 
     if (active_size_ >= active_cap_) {
       // Wait for any in-flight drain to finish before swapping. With
